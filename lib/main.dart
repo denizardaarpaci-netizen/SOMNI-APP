@@ -571,7 +571,7 @@ class AIConciergeScreen extends StatefulWidget {
 }
 
 class _AIConciergeScreenState extends State<AIConciergeScreen> with SingleTickerProviderStateMixin {
-  final String _apiKey = 'AQ.Ab8RN6JV1X7n7W-w0yJowPenyklsnVglLGku1koolMp_WEvT4w';
+  final String _apiKey = 'As a user here ıs where you need to ınsert your own GEMINI API thats free and only needs a sımple copy paste, enjoy SOMNI :)';
   final TextEditingController _ctrl = TextEditingController();
   final ScrollController _scroll = ScrollController();
   final List<Map<String, dynamic>> _messages = [];
