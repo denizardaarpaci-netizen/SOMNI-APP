@@ -1,4 +1,4 @@
-# appprototype1
+# appprototype
 
 A new Flutter project.
 
