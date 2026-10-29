@@ -1,17 +1,33 @@
-# appprototype
+# SOMNI — Screenless Sleep & Fitness Tracker
 
-A new Flutter project.
+SOMNI is an independent engineering project developing a screenless wearable designed to track sleep, heart rate, and daily activity. It combines embedded hardware, sensor integration, Bluetooth connectivity, and a Flutter mobile application with an AI-powered assistant.
 
-## Getting Started
+## Project Overview
 
-This project is a starting point for a Flutter application.
+The goal is to create a compact wearable that collects health-related data without requiring a screen, with insights accessible through a companion mobile app.
 
-A few resources to get you started if this is your first Flutter project:
+## Key Features
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+- Screenless wearable concept
+- Heart-rate and activity sensing
+- Sleep tracking and analysis
+- Bluetooth connectivity
+- Flutter mobile application
+- AI-assisted insights through Gemini
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+## Technology Stack
+
+- **Mobile app:** Flutter and Dart
+- **Embedded hardware:** ESP32-C6
+- **Sensors:** MAX30102 and LIS3DSH
+- **AI integration:** Google Gemini API
+
+## Development Status
+
+SOMNI is an ongoing prototype. Hardware integration, sensor readings, mobile connectivity, and app features are being developed and tested. Not all features are complete or clinically validated.
+
+## Repository
+
+This repository documents the software development and technical progress of SOMNI.
+
+*An independent engineering project exploring wearable technology, embedded systems, and mobile software.*
