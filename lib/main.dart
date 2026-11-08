@@ -1,16 +1,28 @@
 
 import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'firebase_options.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'dart:ui';
 import 'dart:math' as math;
 import 'dart:convert';
 import 'dart:async';
-import 'dart:io' show Platform;
+import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+
+  // Do not let a remembered browser/Firebase session bypass the login form.
+  // A fresh email + password sign-in is required every time SOMNI starts.
+  await FirebaseAuth.instance.signOut();
+
   runApp(const SomniApp());
 }
 
@@ -94,12 +106,87 @@ class SomniApp extends StatefulWidget {
 }
 
 class _SomniAppState extends State<SomniApp> {
+  // App phases: 0 = authentication, 1 = mandatory SOMNI link,
+  // 2 = onboarding, 3 = dashboard.
   int _appPhase = 0;
+  // Only a successful sign-in from this app launch can unlock the device gate.
+  // Firebase's restored/cached user alone is never sufficient.
+  bool _explicitlyAuthenticatedThisRun = false;
   String _capturedEmail = '';
   UserProfile? _masterProfile;
   final List<SavedNotebook> _masterVault = [];
+  StreamSubscription<User?>? _authSubscription;
+  final SomniBluetoothService _bluetooth = SomniBluetoothService();
+
+  @override
+  void initState() {
+    super.initState();
+    _bluetooth.addListener(_handleBluetoothState);
+    _authSubscription = FirebaseAuth.instance.authStateChanges().listen((user) {
+      if (!mounted) return;
+
+      // Never navigate forward merely because Firebase restored a saved user.
+      // The login form must first complete signInWithEmailAndPassword during
+      // this launch, and the account's mailbox must be verified.
+      if (user == null || !user.emailVerified) {
+        _explicitlyAuthenticatedThisRun = false;
+        if (_appPhase != 0) {
+          setState(() {
+            _capturedEmail = '';
+            _masterProfile = null;
+            _appPhase = 0;
+          });
+        }
+        return;
+      }
+
+      if (_explicitlyAuthenticatedThisRun && _appPhase == 0) {
+        setState(() {
+          _capturedEmail = user.email ?? '';
+          _appPhase = 1;
+        });
+      }
+    });
+  }
+
+  void _handleBluetoothState() {
+    if (!mounted) return;
+
+    final user = FirebaseAuth.instance.currentUser;
+    if (!_explicitlyAuthenticatedThisRun || user == null || !user.emailVerified) {
+      if (_appPhase != 0) setState(() => _appPhase = 0);
+      return;
+    }
+
+    // Never leave onboarding or the dashboard accessible without a live,
+    // connected SOMNI GATT notification characteristic.
+    if (_appPhase >= 2 && !_bluetooth.isReady) {
+      setState(() => _appPhase = 1);
+    } else if (_appPhase == 1 && _bluetooth.isReady) {
+      setState(() => _appPhase = _masterProfile == null ? 2 : 3);
+    }
+  }
+
+  @override
+  void dispose() {
+    _authSubscription?.cancel();
+    _bluetooth.removeListener(_handleBluetoothState);
+    _bluetooth.dispose();
+    super.dispose();
+  }
 
   void _proceedToOnboarding(String email) {
+    // Defense-in-depth: this callback may only be reached after Firebase
+    // accepted the actual credentials and the user record was reloaded.
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null || !user.emailVerified ||
+        (user.email ?? '').toLowerCase() != email.toLowerCase()) {
+      FirebaseAuth.instance.signOut();
+      return;
+    }
+
+    _explicitlyAuthenticatedThisRun = true;
+    // Authentication only grants access to the mandatory device-link screen.
     setState(() {
       _capturedEmail = email;
       _appPhase = 1;
@@ -107,9 +194,18 @@ class _SomniAppState extends State<SomniApp> {
   }
 
   void _finalizeSystemBoot(UserProfile profile) {
+    final user = FirebaseAuth.instance.currentUser;
+    if (!_explicitlyAuthenticatedThisRun || user == null || !user.emailVerified) {
+      setState(() => _appPhase = 0);
+      return;
+    }
+    if (!_bluetooth.isReady) {
+      setState(() => _appPhase = 1);
+      return;
+    }
     setState(() {
       _masterProfile = profile;
-      _appPhase = 2;
+      _appPhase = 3;
     });
   }
 
@@ -118,14 +214,27 @@ class _SomniAppState extends State<SomniApp> {
   }
 
   void _saveToVault(SavedNotebook notebook) {
-    setState(() => _masterVault.insert(0, notebook)); 
+    setState(() => _masterVault.insert(0, notebook));
   }
 
-  void _terminateSession() {
-    setState(() {
-      _appPhase = 0;
-      _masterProfile = null;
-    });
+  Future<void> _terminateSession() async {
+    try {
+      await _bluetooth.stopScan();
+      await _bluetooth.disconnect();
+      await FirebaseAuth.instance.signOut();
+      _explicitlyAuthenticatedThisRun = false;
+      if (!mounted) return;
+      setState(() {
+        _appPhase = 0;
+        _capturedEmail = '';
+        _masterProfile = null;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not sign out. Please try again.')),
+      );
+    }
   }
 
   @override
@@ -135,14 +244,26 @@ class _SomniAppState extends State<SomniApp> {
     if (_appPhase == 0) {
       currentInterface = AuthScreen(onAuthenticate: _proceedToOnboarding);
     } else if (_appPhase == 1) {
-      currentInterface = OnboardingScreen(email: _capturedEmail, onCompile: _finalizeSystemBoot);
+      currentInterface = BluetoothConnectGate(
+        key: const ValueKey('MandatoryBluetoothGate'),
+        bluetooth: _bluetooth,
+        onLogout: _terminateSession,
+      );
+    } else if (_appPhase == 2) {
+      currentInterface = OnboardingScreen(
+        email: _capturedEmail,
+        onCompile: _finalizeSystemBoot,
+      );
     } else {
       currentInterface = SomniSystemCore(
         profile: _masterProfile!,
         vault: _masterVault,
         updateProfile: _updateProfile,
         saveToVault: _saveToVault,
-        child: MainNavigationTerminal(onLogout: _terminateSession),
+        child: MainNavigationTerminal(
+          onLogout: _terminateSession,
+          bluetooth: _bluetooth,
+        ),
       );
     }
 
@@ -179,15 +300,23 @@ class AuthScreen extends StatefulWidget {
   State<AuthScreen> createState() => _AuthScreenState();
 }
 
-class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateMixin {
+class _AuthScreenState extends State<AuthScreen>
+    with SingleTickerProviderStateMixin {
   late AnimationController _bgController;
   final _emailController = TextEditingController();
   final _passController = TextEditingController();
+  final _confirmPassController = TextEditingController();
+  bool _isCreatingAccount = false;
+  bool _isLoading = false;
+  bool _showPassword = false;
 
   @override
   void initState() {
     super.initState();
-    _bgController = AnimationController(vsync: this, duration: const Duration(seconds: 30))..repeat();
+    _bgController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 30),
+    )..repeat();
   }
 
   @override
@@ -195,19 +324,185 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
     _bgController.dispose();
     _emailController.dispose();
     _passController.dispose();
+    _confirmPassController.dispose();
     super.dispose();
   }
 
-  void _triggerAuth() {
-    if (_emailController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Identity uplink required (Email).'), backgroundColor: Color(0xFF1E2124)));
+  void _showMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: const Color(0xFF1E2124),
+        ),
+      );
+  }
+
+  String _authErrorMessage(FirebaseAuthException error) {
+    switch (error.code) {
+      case 'email-already-in-use':
+        return 'An account already exists for this email. Sign in instead.';
+      case 'invalid-email':
+        return 'Enter a valid email address.';
+      case 'weak-password':
+        return 'Choose a stronger password.';
+      case 'verification-email-failed':
+        return 'The account was created, but Firebase could not send the verification email. Try signing in to resend it.';
+      case 'user-not-found':
+      case 'wrong-password':
+      case 'invalid-credential':
+        return 'Email or password is incorrect.';
+      case 'user-disabled':
+        return 'This account has been disabled.';
+      case 'too-many-requests':
+        return 'Too many attempts. Please try again later.';
+      case 'network-request-failed':
+        return 'Network error. Check your internet connection.';
+      case 'operation-not-allowed':
+        return 'Email/password sign-in is not enabled in Firebase yet.';
+      default:
+        return error.message ?? 'Authentication failed. Please try again.';
+    }
+  }
+
+  bool _hasStrongPassword(String password) {
+    return password.length >= 8 &&
+        RegExp(r'[A-Z]').hasMatch(password) &&
+        RegExp(r'[a-z]').hasMatch(password) &&
+        RegExp(r'[0-9]').hasMatch(password);
+  }
+
+  Future<void> _triggerAuth() async {
+    final email = _emailController.text.trim();
+    final password = _passController.text;
+
+    if (email.isEmpty || password.isEmpty) {
+      _showMessage('Enter both your email and password.');
       return;
     }
-    widget.onAuthenticate(_emailController.text.trim());
+    if (email.length > 254 ||
+        !RegExp(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$")
+            .hasMatch(email)) {
+      _showMessage('Enter a valid email address, such as name@example.com.');
+      return;
+    }
+    if (_isCreatingAccount && !_hasStrongPassword(password)) {
+      _showMessage(
+        'Use at least 8 characters, including an uppercase letter, a lowercase letter, and a number.',
+      );
+      return;
+    }
+    if (!_isCreatingAccount && password.length < 6) {
+      _showMessage('Enter the password for your Firebase account.');
+      return;
+    }
+    if (_isCreatingAccount && password != _confirmPassController.text) {
+      _showMessage('The passwords do not match.');
+      return;
+    }
+
+    setState(() => _isLoading = true);
+    try {
+      if (_isCreatingAccount) {
+        final credential = await FirebaseAuth.instance
+            .createUserWithEmailAndPassword(
+          email: email,
+          password: password,
+        );
+        final newUser = credential.user;
+        if (newUser == null) {
+          throw FirebaseAuthException(
+            code: 'verification-email-failed',
+            message: 'Firebase did not return the newly created user.',
+          );
+        }
+
+        // Verify control of the mailbox before allowing access to SOMNI.
+        try {
+          await newUser.sendEmailVerification();
+        } catch (_) {
+          await FirebaseAuth.instance.signOut();
+          throw FirebaseAuthException(code: 'verification-email-failed');
+        }
+        await FirebaseAuth.instance.signOut();
+        if (!mounted) return;
+        setState(() {
+          _isCreatingAccount = false;
+          _passController.clear();
+          _confirmPassController.clear();
+        });
+        _showMessage(
+          'Account created. Open the verification link sent to $email, then sign in here.',
+        );
+        return;
+      }
+
+      final credential = await FirebaseAuth.instance.signInWithEmailAndPassword(
+        email: email,
+        password: password,
+      );
+      await credential.user?.reload();
+      final signedInUser = FirebaseAuth.instance.currentUser;
+
+      if (signedInUser == null) {
+        _showMessage('Firebase could not confirm this sign-in. Please try again.');
+        return;
+      }
+
+      if (!signedInUser.emailVerified) {
+        var verificationSent = false;
+        try {
+          await signedInUser.sendEmailVerification();
+          verificationSent = true;
+        } catch (_) {
+          // The account remains blocked; the error below tells the user to retry.
+        }
+        await FirebaseAuth.instance.signOut();
+        _showMessage(
+          verificationSent
+              ? 'This email is not verified yet. We sent a new verification link. Verify it, then sign in again.'
+              : 'This email is not verified yet. We could not resend the link; check your connection and try again.',
+        );
+        return;
+      }
+
+      if (!mounted) return;
+      widget.onAuthenticate(signedInUser.email ?? email);
+    } on FirebaseAuthException catch (error) {
+      _showMessage(_authErrorMessage(error));
+    } catch (_) {
+      _showMessage('Could not connect to Firebase Authentication. Check your internet connection and Firebase setup.');
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _resetPassword() async {
+    final email = _emailController.text.trim();
+    if (email.length > 254 ||
+        !RegExp(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$")
+            .hasMatch(email)) {
+      _showMessage('Enter a valid email address before requesting a reset.');
+      return;
+    }
+    setState(() => _isLoading = true);
+    try {
+      await FirebaseAuth.instance.sendPasswordResetEmail(email: email);
+      _showMessage('If a SOMNI account exists for this email, Firebase has sent a password-reset link. Check your inbox and spam folder.');
+    } on FirebaseAuthException catch (error) {
+      _showMessage(_authErrorMessage(error));
+    } catch (_) {
+      _showMessage('Could not send the reset email. Check your connection.');
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
+    final creating = _isCreatingAccount;
     return Scaffold(
       key: const ValueKey('AuthScreen'),
       backgroundColor: const Color(0xFF0D0D0D),
@@ -215,66 +510,513 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
         children: [
           AnimatedBuilder(
             animation: _bgController,
-            builder: (context, child) => CustomPaint(painter: QuantumAuthPainter(animationValue: _bgController.value), size: Size.infinite),
+            builder: (context, child) => CustomPaint(
+              painter: QuantumAuthPainter(
+                animationValue: _bgController.value,
+              ),
+              size: Size.infinite,
+            ),
           ),
           Center(
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(24),
-              child: BackdropFilter(
-                filter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
-                child: Container(
-                  width: MediaQuery.of(context).size.width * 0.85,
-                  padding: const EdgeInsets.all(40),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.1),
-                    borderRadius: BorderRadius.circular(24),
-                    border: Border.all(color: const Color(0xFFB59451).withValues(alpha: 0.3), width: 1),
-                  ),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text('S O M N I', style: GoogleFonts.playfairDisplay(fontSize: 42, color: Colors.white, letterSpacing: 12, fontWeight: FontWeight.bold)),
-                      const SizedBox(height: 8),
-                      Text('QUANTUM HEALTH SYSTEM', style: GoogleFonts.lato(fontSize: 10, letterSpacing: 5, color: const Color(0xFFB59451), fontWeight: FontWeight.bold)),
-                      const SizedBox(height: 48),
-                      _buildField(_emailController, 'Encrypted Identity (Email)', Icons.fingerprint),
-                      const SizedBox(height: 16),
-                      _buildField(_passController, 'Biometric Passcode', Icons.lock_outline, obscure: true),
-                      const SizedBox(height: 40),
-                      SizedBox(
-                        width: double.infinity, height: 56,
-                        child: ElevatedButton(
-                          style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFB59451), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
-                          onPressed: _triggerAuth,
-                          child: Text('INITIALIZE SYSTEM', style: GoogleFonts.lato(fontSize: 12, letterSpacing: 3, color: Colors.black, fontWeight: FontWeight.bold)),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.symmetric(vertical: 32),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(24),
+                child: BackdropFilter(
+                  filter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
+                  child: Container(
+                    width: math.min(
+                      MediaQuery.of(context).size.width * 0.88,
+                      470,
+                    ).toDouble(),
+                    padding: const EdgeInsets.all(32),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(24),
+                      border: Border.all(
+                        color: const Color(0xFFB59451).withValues(alpha: 0.3),
+                        width: 1,
+                      ),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          'S O M N I',
+                          style: GoogleFonts.playfairDisplay(
+                            fontSize: 38,
+                            color: Colors.white,
+                            letterSpacing: 10,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
-                      )
-                    ],
+                        const SizedBox(height: 8),
+                        Text(
+                          'QUANTUM HEALTH SYSTEM',
+                          style: GoogleFonts.lato(
+                            fontSize: 10,
+                            letterSpacing: 4,
+                            color: const Color(0xFFB59451),
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 36),
+                        Text(
+                          creating ? 'CREATE YOUR ACCOUNT' : 'WELCOME BACK',
+                          style: GoogleFonts.lato(
+                            fontSize: 12,
+                            letterSpacing: 3,
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 24),
+                        _buildField(
+                          _emailController,
+                          'Email address',
+                          Icons.alternate_email,
+                          keyboardType: TextInputType.emailAddress,
+                        ),
+                        const SizedBox(height: 14),
+                        _buildField(
+                          _passController,
+                          'Password',
+                          Icons.lock_outline,
+                          obscure: !_showPassword,
+                        ),
+                        if (creating) ...[
+                          const SizedBox(height: 14),
+                          _buildField(
+                            _confirmPassController,
+                            'Confirm password',
+                            Icons.lock_reset,
+                            obscure: !_showPassword,
+                          ),
+                        ],
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Checkbox(
+                              value: _showPassword,
+                              activeColor: const Color(0xFFB59451),
+                              onChanged: _isLoading
+                                  ? null
+                                  : (value) => setState(
+                                        () => _showPassword = value ?? false,
+                                      ),
+                            ),
+                            Text(
+                              'Show password',
+                              style: GoogleFonts.lato(
+                                color: Colors.white70,
+                                fontSize: 12,
+                              ),
+                            ),
+                            const Spacer(),
+                            if (!creating)
+                              TextButton(
+                                onPressed: _isLoading ? null : _resetPassword,
+                                child: Text(
+                                  'Forgot password?',
+                                  style: GoogleFonts.lato(
+                                    color: const Color(0xFFB59451),
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 20),
+                        SizedBox(
+                          width: double.infinity,
+                          height: 54,
+                          child: ElevatedButton(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFFB59451),
+                              disabledBackgroundColor:
+                                  const Color(0xFF806B42),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                            onPressed: _isLoading ? null : _triggerAuth,
+                            child: _isLoading
+                                ? const SizedBox(
+                                    width: 22,
+                                    height: 22,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.black,
+                                    ),
+                                  )
+                                : Text(
+                                    creating
+                                        ? 'CREATE ACCOUNT'
+                                        : 'SIGN IN',
+                                    style: GoogleFonts.lato(
+                                      fontSize: 12,
+                                      letterSpacing: 3,
+                                      color: Colors.black,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                          ),
+                        ),
+                        const SizedBox(height: 20),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text(
+                              creating
+                                  ? 'Already have an account? '
+                                  : 'New to SOMNI? ',
+                              style: GoogleFonts.lato(
+                                color: Colors.white70,
+                                fontSize: 12,
+                              ),
+                            ),
+                            TextButton(
+                              onPressed: _isLoading
+                                  ? null
+                                  : () => setState(() {
+                                        _isCreatingAccount =
+                                            !_isCreatingAccount;
+                                        _passController.clear();
+                                        _confirmPassController.clear();
+                                      }),
+                              child: Text(
+                                creating ? 'Sign in' : 'Create account',
+                                style: GoogleFonts.lato(
+                                  color: const Color(0xFFB59451),
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Firebase verifies your password and email before granting access.',
+                          textAlign: TextAlign.center,
+                          style: GoogleFonts.lato(
+                            fontSize: 10,
+                            color: Colors.white54,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
             ),
-          )
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildField(TextEditingController controller, String hint, IconData icon, {bool obscure = false}) {
+  Widget _buildField(
+    TextEditingController controller,
+    String hint,
+    IconData icon, {
+    bool obscure = false,
+    TextInputType keyboardType = TextInputType.text,
+  }) {
     return TextField(
-      controller: controller, obscureText: obscure,
+      controller: controller,
+      obscureText: obscure,
+      keyboardType: keyboardType,
+      autocorrect: false,
+      enableSuggestions: false,
       style: GoogleFonts.lato(color: Colors.white),
       decoration: InputDecoration(
-        prefixIcon: Icon(icon, color: const Color(0xFFB59451), size: 20),
-        hintText: hint, hintStyle: GoogleFonts.lato(color: Colors.grey.shade500),
-        filled: true, fillColor: Colors.black.withValues(alpha: 0.5),
-        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
+        prefixIcon: Icon(
+          icon,
+          color: const Color(0xFFB59451),
+          size: 20,
+        ),
+        hintText: hint,
+        hintStyle: GoogleFonts.lato(color: Colors.grey.shade500),
+        filled: true,
+        fillColor: Colors.black.withValues(alpha: 0.5),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(8),
+          borderSide: BorderSide.none,
+        ),
       ),
     );
   }
 }
 
 
+class BluetoothConnectGate extends StatefulWidget {
+  final SomniBluetoothService bluetooth;
+  final Future<void> Function() onLogout;
+
+  const BluetoothConnectGate({
+    super.key,
+    required this.bluetooth,
+    required this.onLogout,
+  });
+
+  @override
+  State<BluetoothConnectGate> createState() => _BluetoothConnectGateState();
+}
+
+class _BluetoothConnectGateState extends State<BluetoothConnectGate> {
+  bool _isSupportedHealthDevice(ScanResult result) =>
+      SomniBluetoothService.isSupportedHealthScanResult(result);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      key: const ValueKey('BluetoothConnectGate'),
+      backgroundColor: const Color(0xFFF4F3EF),
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 620),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 28),
+              child: AnimatedBuilder(
+                animation: widget.bluetooth,
+                builder: (context, _) {
+                  final bluetooth = widget.bluetooth;
+                  final supportedResults = bluetooth.scanResults
+                      .where(_isSupportedHealthDevice)
+                      .toList(growable: false);
+                  final connected = bluetooth.isReady;
+                  final connectedButNotReady =
+                      bluetooth.connectionState == BluetoothConnectionState.connected &&
+                      !bluetooth.isReady;
+
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            'S O M N I',
+                            style: GoogleFonts.playfairDisplay(
+                              fontSize: 23,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 6,
+                              color: const Color(0xFF1E2124),
+                            ),
+                          ),
+                          TextButton.icon(
+                            onPressed: () { widget.onLogout(); },
+                            icon: const Icon(Icons.logout, size: 16),
+                            label: const Text('LOG OUT'),
+                            style: TextButton.styleFrom(
+                              foregroundColor: const Color(0xFF6C6C6C),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const Spacer(),
+                      Container(
+                        width: 84,
+                        height: 84,
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: const Color(0xFF1E2124),
+                          boxShadow: [
+                            BoxShadow(
+                              color: const Color(0xFFB59451).withValues(alpha: 0.20),
+                              blurRadius: 28,
+                              spreadRadius: 4,
+                            ),
+                          ],
+                        ),
+                        child: Icon(
+                          connected ? Icons.bluetooth_connected : Icons.bluetooth_searching,
+                          color: const Color(0xFFB59451),
+                          size: 38,
+                        ),
+                      ),
+                      const SizedBox(height: 30),
+                      Text(
+                        'DEVICE CONNECTION REQUIRED',
+                        textAlign: TextAlign.center,
+                        style: GoogleFonts.lato(
+                          fontSize: 11,
+                          letterSpacing: 3,
+                          fontWeight: FontWeight.bold,
+                          color: const Color(0xFFB59451),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Text(
+                        connected ? 'Health device connected' : 'Connect a health device',
+                        textAlign: TextAlign.center,
+                        style: GoogleFonts.playfairDisplay(
+                          fontSize: 30,
+                          fontWeight: FontWeight.bold,
+                          color: const Color(0xFF1E2124),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        'Connect SOMNI or a compatible health-monitoring device. Unrelated Bluetooth devices are not accepted. There is no demo mode or skip option.',
+                        textAlign: TextAlign.center,
+                        style: GoogleFonts.lato(
+                          fontSize: 14,
+                          height: 1.6,
+                          color: const Color(0xFF777777),
+                        ),
+                      ),
+                      const SizedBox(height: 28),
+                      if (connected)
+                        Container(
+                          padding: const EdgeInsets.all(18),
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(14),
+                            border: Border.all(color: const Color(0xFFB59451)),
+                          ),
+                          child: Row(
+                            children: [
+                              const Icon(Icons.check_circle, color: Color(0xFF388E3C)),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Text(
+                                  'Connected to ${bluetooth.connectedDeviceName ?? 'SOMNI'}. Opening the app…',
+                                  style: GoogleFonts.lato(fontWeight: FontWeight.bold),
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      else ...[
+                        SizedBox(
+                          height: 52,
+                          child: ElevatedButton.icon(
+                            onPressed: bluetooth.isScanning ? null : bluetooth.startScan,
+                            icon: Icon(
+                              bluetooth.isScanning ? Icons.radar : Icons.bluetooth_searching,
+                            ),
+                            label: Text(
+                              bluetooth.isScanning ? 'SEARCHING FOR HEALTH DEVICES…' : 'SCAN FOR HEALTH DEVICES',
+                              style: GoogleFonts.lato(
+                                letterSpacing: 1.5,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF1E2124),
+                              foregroundColor: const Color(0xFFB59451),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                          ),
+                        ),
+                        if (bluetooth.errorMessage != null) ...[
+                          const SizedBox(height: 12),
+                          Text(
+                            bluetooth.errorMessage!,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(color: Colors.red, fontSize: 12),
+                          ),
+                        ],
+                        if (connectedButNotReady) ...[
+                          const SizedBox(height: 12),
+                          const Text(
+                            'The device connected but exposed no supported readable or live sensor characteristic. It cannot be used by SOMNI yet.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: Colors.red, fontSize: 12, height: 1.4),
+                          ),
+                        ],
+                        const SizedBox(height: 18),
+                        Text(
+                          'AVAILABLE HEALTH DEVICES',
+                          style: GoogleFonts.lato(
+                            fontSize: 10,
+                            letterSpacing: 2,
+                            fontWeight: FontWeight.bold,
+                            color: const Color(0xFF8A8A8A),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Expanded(
+                          child: supportedResults.isEmpty
+                              ? Center(
+                                  child: Text(
+                                    bluetooth.isScanning
+                                        ? 'Scanning nearby Bluetooth devices…'
+                                        : bluetooth.scanResults.isEmpty
+                                            ? 'Tap Scan to find SOMNI or a compatible health device nearby.'
+                                            : 'No compatible health device was found. Make sure its Bluetooth health service is enabled and nearby.',
+                                    textAlign: TextAlign.center,
+                                    style: GoogleFonts.lato(
+                                      color: const Color(0xFF8A8A8A),
+                                      height: 1.5,
+                                      fontSize: 13,
+                                    ),
+                                  ),
+                                )
+                              : ListView.separated(
+                                  itemCount: supportedResults.length,
+                                  separatorBuilder: (_, __) => const SizedBox(height: 8),
+                                  itemBuilder: (context, index) {
+                                    final result = supportedResults[index];
+                                    final device = result.device;
+                                    final name = device.platformName.isNotEmpty
+                                        ? device.platformName
+                                        : result.advertisementData.advName;
+                                    return Container(
+                                      decoration: BoxDecoration(
+                                        color: Colors.white,
+                                        borderRadius: BorderRadius.circular(12),
+                                        border: Border.all(color: const Color(0xFFE5E1D8)),
+                                      ),
+                                      child: ListTile(
+                                        leading: const Icon(Icons.watch, color: Color(0xFFB59451)),
+                                        title: Text(
+                                          name.isEmpty ? 'SOMNI wearable' : name,
+                                          style: GoogleFonts.lato(fontWeight: FontWeight.bold),
+                                        ),
+                                        subtitle: Text(
+                                          'Signal strength: ${result.rssi} dBm',
+                                          style: GoogleFonts.lato(fontSize: 11),
+                                        ),
+                                        trailing: TextButton(
+                                          onPressed: () => bluetooth.connect(
+                                            device,
+                                            advertisedName: result.advertisementData.advName,
+                                          ),
+                                          child: const Text('CONNECT'),
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                        ),
+                      ],
+                      const SizedBox(height: 12),
+                      Text(
+                        kIsWeb
+                            ? 'On Chrome, allow Bluetooth access when prompted. Use localhost or HTTPS for Web Bluetooth.'
+                            : 'Keep your health device powered on and nearby. Bluetooth permission must be allowed.',
+                        textAlign: TextAlign.center,
+                        style: GoogleFonts.lato(fontSize: 10, color: const Color(0xFF9A9A9A)),
+                      ),
+                      const Spacer(),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 
 class OnboardingScreen extends StatefulWidget {
@@ -302,8 +1044,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   void _constructProfile() {
     List<Goal> chosenGoals = _goalsDB.where((g) => g['selected'] == true).map((g) {
       return Goal(
-        title: g['title'], description: g['desc'], overallProgress: 0.15,
-        metrics: [SubMetric("Adherence", 0.8), SubMetric("Biomarker Shift", 0.2), SubMetric("AI Confidence", 0.45)],
+        title: g['title'], description: g['desc'], overallProgress: 0.0,
+        metrics: [],
       );
     }).toList();
 
@@ -425,16 +1167,204 @@ class SomniBluetoothService extends ChangeNotifier {
   BluetoothConnectionState connectionState =
       BluetoothConnectionState.disconnected;
   bool isScanning = false;
+  bool _hasNotifyCharacteristic = false;
+  bool _isSomniHardware = false;
+  bool _isSupportedHealthPeripheral = false;
+
+  static const Set<String> _healthServiceShortUuids = {
+    '1808', // Glucose
+    '1809', // Health Thermometer
+    '180d', // Heart Rate
+    '1810', // Blood Pressure
+    '1814', // Running Speed and Cadence
+    '1816', // Cycling Speed and Cadence
+    '181b', // Body Composition
+    '181d', // Weight Scale
+    '1822', // Pulse Oximeter
+    '1826', // Fitness Machine
+  };
+
+  static String _normalizedUuid(Object uuid) =>
+      uuid.toString().toLowerCase().replaceAll('-', '');
+
+  static bool _hasHealthService(Iterable<Guid> uuids) => uuids.any((uuid) {
+        final normalized = _normalizedUuid(uuid);
+        return _healthServiceShortUuids.any(normalized.contains);
+      });
+
+  static bool _looksLikeHealthDeviceName(String name) {
+    final n = name.toLowerCase();
+    return n.contains('somni') ||
+        n.contains('fitbit') || n.contains('garmin') ||
+        n.contains('huawei') || n.contains('honor') ||
+        n.contains('amazfit') || n.contains('mi band') ||
+        n.contains('xiaomi') || n.contains('whoop') ||
+        n.contains('polar') || n.contains('oura') ||
+        n.contains('samsung') || n.contains('galaxy watch') ||
+        n.contains('smart ring') || n.contains('ringconn') ||
+        n.contains('ultrahuman') ||
+        n.contains('fitness') || n.contains('heart rate') ||
+        n.contains('health') || n.contains('smart band') ||
+        n.contains('smartwatch');
+  }
+
+  static bool isSupportedHealthScanResult(ScanResult result) {
+    final platformName = result.device.platformName.trim();
+    final advertisedName = result.advertisementData.advName.trim();
+    final name = platformName.isNotEmpty ? platformName : advertisedName;
+    final advertisedHealthService = _hasHealthService(
+      result.advertisementData.serviceUuids,
+    );
+    // Names are only a scan hint. A third-party device is accepted only after
+    // its discovered GATT services prove that it exposes a standard health service.
+    return name.toUpperCase().contains('SOMNI') ||
+        advertisedHealthService || _looksLikeHealthDeviceName(name);
+  }
+
+  bool get isSomniHardware => _isSomniHardware;
+  bool get isSupportedHealthPeripheral => _isSupportedHealthPeripheral;
+
+  bool get isReady =>
+      connectionState == BluetoothConnectionState.connected &&
+      connectedDevice != null &&
+      _hasNotifyCharacteristic;
   String latestData = 'No sensor data received yet.';
   String statusMessage = 'Bluetooth is ready.';
   String? errorMessage;
   String? connectedDeviceName;
+  final Map<String, double> sensorMetrics = {};
+  Timer? _sensorDataStaleTimer;
+
+  bool get hasSensorData => sensorMetrics.isNotEmpty;
 
   StreamSubscription<List<ScanResult>>? _scanResultsSubscription;
   StreamSubscription<bool>? _scanningSubscription;
   StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
   StreamSubscription<List<int>>? _dataSubscription;
   BluetoothCharacteristic? _activeNotifyCharacteristic;
+
+  void _clearSensorData() {
+    _sensorDataStaleTimer?.cancel();
+    _sensorDataStaleTimer = null;
+    sensorMetrics.clear();
+  }
+
+  void _processStandardHeartRate(List<int> bytes) {
+    if (bytes.length < 2) return;
+    final flags = bytes[0];
+    final is16Bit = (flags & 0x01) != 0;
+    final bpm = is16Bit && bytes.length >= 3
+        ? bytes[1] | (bytes[2] << 8)
+        : bytes[1];
+    if (bpm < 25 || bpm > 240) return;
+    sensorMetrics['hr'] = bpm.toDouble();
+    latestData = 'Heart rate: $bpm bpm (Bluetooth SIG Heart Rate Measurement)';
+    statusMessage = 'Receiving heart-rate data from $connectedDeviceName.';
+    _sensorDataStaleTimer?.cancel();
+    _sensorDataStaleTimer = Timer(const Duration(seconds: 20), () {
+      sensorMetrics.clear();
+      statusMessage = 'Connected, but no recent sensor data is available.';
+      notifyListeners();
+    });
+    notifyListeners();
+  }
+
+  void _processSensorPayload(String payload) {
+    final Map<String, dynamic> fields = {};
+
+    void collectFields(dynamic value) {
+      if (value is Map) {
+        value.forEach((key, nestedValue) {
+          if (nestedValue is Map) {
+            collectFields(nestedValue);
+          } else {
+            final normalizedKey = key
+                .toString()
+                .toLowerCase()
+                .replaceAll(RegExp(r'[^a-z0-9]'), '');
+            fields[normalizedKey] = nestedValue;
+          }
+        });
+      }
+    }
+
+    try {
+      collectFields(jsonDecode(payload));
+    } catch (_) {
+      final pairs = RegExp(
+        r'([A-Za-z][A-Za-z0-9_ ]*)\s*[:=]\s*(-?\d+(?:\.\d+)?)',
+      ).allMatches(payload);
+      for (final pair in pairs) {
+        final key = pair.group(1)!
+            .toLowerCase()
+            .replaceAll(RegExp(r'[^a-z0-9]'), '');
+        fields[key] = pair.group(2);
+      }
+    }
+
+    double? readNumber(List<String> keys) {
+      for (final key in keys) {
+        final value = fields[key];
+        if (value is num) return value.toDouble();
+        if (value is String) {
+          final parsed = double.tryParse(value.trim());
+          if (parsed != null) return parsed;
+        }
+      }
+      return null;
+    }
+
+    final incoming = <String, double>{};
+    final heartRate = readNumber([
+      'heartrate', 'heartratebpm', 'hr', 'hrbpm', 'bpm', 'pulse'
+    ]);
+    if (heartRate != null && heartRate >= 25 && heartRate <= 240) {
+      incoming['hr'] = heartRate;
+    }
+
+    final hrv = readNumber([
+      'hrv', 'heartratevariability', 'heartratevariabilityms'
+    ]);
+    if (hrv != null && hrv > 0 && hrv <= 300) {
+      incoming['hrv'] = hrv;
+    }
+
+    final oxygen = readNumber([
+      'spo2', 'spo2percent', 'oxygensaturation', 'bloodoxygen', 'oxygen'
+    ]);
+    if (oxygen != null && oxygen >= 50 && oxygen <= 100) {
+      incoming['spo2'] = oxygen;
+    }
+
+    final steps = readNumber(['steps', 'stepcount']);
+    if (steps != null && steps >= 0 && steps <= 200000) {
+      incoming['steps'] = steps;
+    }
+
+    final temperature = readNumber([
+      'temperature', 'temperaturec', 'tempc', 'bodytemperature'
+    ]);
+    if (temperature != null && temperature >= 20 && temperature <= 50) {
+      incoming['temperature'] = temperature;
+    }
+
+    if (incoming.isEmpty) {
+      statusMessage =
+          'Connected. Received data, but no supported sensor fields were found.';
+      notifyListeners();
+      return;
+    }
+
+    sensorMetrics.addAll(incoming);
+    statusMessage = 'Receiving sensor data from $connectedDeviceName.';
+    _sensorDataStaleTimer?.cancel();
+    _sensorDataStaleTimer = Timer(const Duration(seconds: 20), () {
+      sensorMetrics.clear();
+      statusMessage = 'Connected, but no recent sensor data is available.';
+      notifyListeners();
+    });
+    notifyListeners();
+  }
 
   SomniBluetoothService() {
     _scanResultsSubscription = FlutterBluePlus.scanResults.listen((results) {
@@ -450,7 +1380,7 @@ class SomniBluetoothService extends ChangeNotifier {
   }
 
   Future<bool> _requestAndroidPermissions() async {
-    if (!Platform.isAndroid) return true;
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return true;
 
     final statuses = await <Permission>[
       Permission.bluetoothScan,
@@ -514,8 +1444,16 @@ class SomniBluetoothService extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> connect(BluetoothDevice device) async {
+  Future<void> connect(BluetoothDevice device, {String? advertisedName}) async {
+    final deviceName = (device.platformName.trim().isNotEmpty
+            ? device.platformName
+            : (advertisedName ?? ''))
+        .trim();
+    final isSomni = deviceName.toUpperCase().contains('SOMNI');
     try {
+      _hasNotifyCharacteristic = false;
+      _isSomniHardware = isSomni;
+      _isSupportedHealthPeripheral = false;
       errorMessage = null;
       statusMessage = 'Connecting to ${device.platformName.isEmpty ? device.remoteId.str : device.platformName}...';
       notifyListeners();
@@ -540,10 +1478,13 @@ class SomniBluetoothService extends ChangeNotifier {
       _connectionSubscription = device.connectionState.listen((state) {
         connectionState = state;
         if (state == BluetoothConnectionState.disconnected) {
+          _hasNotifyCharacteristic = false;
           connectedDevice = null;
           connectedDeviceName = null;
           _dataSubscription?.cancel();
           _activeNotifyCharacteristic = null;
+          _clearSensorData();
+          latestData = 'No sensor data received yet.';
           statusMessage = 'Device disconnected.';
         } else {
           statusMessage = 'Connected to $connectedDeviceName.';
@@ -555,13 +1496,17 @@ class SomniBluetoothService extends ChangeNotifier {
       statusMessage = 'Connected. Discovering sensor services...';
       notifyListeners();
 
-      await _discoverAndListen(device);
+      await _discoverAndListen(device, allowSomniByName: isSomni);
     } catch (e) {
       errorMessage = e.toString();
       statusMessage = 'Connection failed.';
+      _hasNotifyCharacteristic = false;
+      _isSupportedHealthPeripheral = false;
+      _isSomniHardware = false;
       connectionState = BluetoothConnectionState.disconnected;
       connectedDevice = null;
       connectedDeviceName = null;
+      _clearSensorData();
       notifyListeners();
       try {
         await device.disconnect();
@@ -569,54 +1514,87 @@ class SomniBluetoothService extends ChangeNotifier {
     }
   }
 
-  Future<void> _discoverAndListen(BluetoothDevice device) async {
+  Future<void> _discoverAndListen(
+    BluetoothDevice device, {
+    required bool allowSomniByName,
+  }) async {
     final services = await device.discoverServices();
-    BluetoothCharacteristic? notifyCharacteristic;
+    final healthServiceFound = _hasHealthService(
+      services.map((service) => service.serviceUuid),
+    );
+    if (!allowSomniByName && !healthServiceFound) {
+      throw Exception(
+        'This device does not expose a supported standard BLE health service. Proprietary fitness-band protocols need a manufacturer-specific integration.',
+      );
+    }
 
+    final candidates = <BluetoothCharacteristic>[];
     for (final service in services) {
       for (final characteristic in service.characteristics) {
         final properties = characteristic.properties;
-        if (properties.notify || properties.indicate) {
-          notifyCharacteristic = characteristic;
-          break;
+        if (properties.notify || properties.indicate || properties.read) {
+          candidates.add(characteristic);
         }
       }
-      if (notifyCharacteristic != null) break;
     }
+    // Prefer the standard Heart Rate Measurement characteristic when present.
+    candidates.sort((a, b) {
+      final aHr = _normalizedUuid(a.uuid).contains('2a37') ? 0 : 1;
+      final bHr = _normalizedUuid(b.uuid).contains('2a37') ? 0 : 1;
+      if (aHr != bHr) return aHr.compareTo(bHr);
+      final aLive = (a.properties.notify || a.properties.indicate) ? 0 : 1;
+      final bLive = (b.properties.notify || b.properties.indicate) ? 0 : 1;
+      return aLive.compareTo(bLive);
+    });
+    final notifyCharacteristic = candidates.isEmpty ? null : candidates.first;
 
     if (notifyCharacteristic == null) {
+      _hasNotifyCharacteristic = false;
       statusMessage =
-          'Connected, but no BLE notify/indicate characteristic was found.';
+          'Connected, but no readable or live health measurement characteristic was found.';
       latestData =
-          'The ESP32 must expose a GATT characteristic with Notify or Indicate enabled.';
+          'The device must expose a readable or Notify/Indicate health measurement characteristic.';
+      _clearSensorData();
       notifyListeners();
       return;
     }
 
     _activeNotifyCharacteristic = notifyCharacteristic;
-    await notifyCharacteristic.setNotifyValue(true);
     await _dataSubscription?.cancel();
 
-    _dataSubscription = notifyCharacteristic.onValueReceived.listen((bytes) {
-      if (bytes.isEmpty) return;
-
-
-      try {
+    if (notifyCharacteristic.properties.notify ||
+        notifyCharacteristic.properties.indicate) {
+      await notifyCharacteristic.setNotifyValue(true);
+      _dataSubscription = notifyCharacteristic.onValueReceived.listen((bytes) {
+        if (bytes.isEmpty) return;
+        final characteristicUuid = _normalizedUuid(notifyCharacteristic.uuid);
+        if (characteristicUuid.contains('2a37')) {
+          _processStandardHeartRate(bytes);
+        } else {
+          latestData = utf8.decode(bytes, allowMalformed: true).trim();
+          _processSensorPayload(latestData);
+        }
+      });
+    } else if (notifyCharacteristic.properties.read) {
+      final bytes = await notifyCharacteristic.read();
+      if (bytes.isNotEmpty) {
         latestData = utf8.decode(bytes, allowMalformed: true).trim();
-      } catch (_) {
-        latestData = bytes.map((b) => b.toString()).join(', ');
+        _processSensorPayload(latestData);
       }
+    }
 
-      statusMessage = 'Receiving data from $connectedDeviceName.';
-      notifyListeners();
-    });
-
-    statusMessage =
-        'Connected. Listening for sensor notifications (${notifyCharacteristic.uuid}).';
+    _isSupportedHealthPeripheral = healthServiceFound;
+    _hasNotifyCharacteristic = true;
+    statusMessage = allowSomniByName
+        ? 'Connected to SOMNI. Listening for sensor notifications.'
+        : 'Connected to a compatible health device. Standard health services detected.';
     notifyListeners();
   }
 
   Future<void> disconnect() async {
+    _hasNotifyCharacteristic = false;
+    _isSomniHardware = false;
+    _isSupportedHealthPeripheral = false;
     final device = connectedDevice;
     await _dataSubscription?.cancel();
     _dataSubscription = null;
@@ -631,6 +1609,7 @@ class SomniBluetoothService extends ChangeNotifier {
     connectedDevice = null;
     connectedDeviceName = null;
     connectionState = BluetoothConnectionState.disconnected;
+    _clearSensorData();
     statusMessage = 'Device disconnected.';
     latestData = 'No sensor data received yet.';
     notifyListeners();
@@ -642,6 +1621,7 @@ class SomniBluetoothService extends ChangeNotifier {
     _scanningSubscription?.cancel();
     _connectionSubscription?.cancel();
     _dataSubscription?.cancel();
+    _sensorDataStaleTimer?.cancel();
     FlutterBluePlus.stopScan();
     connectedDevice?.disconnect();
     super.dispose();
@@ -659,8 +1639,10 @@ class SomniBluetoothPanel extends StatelessWidget {
     return AnimatedBuilder(
       animation: bluetooth,
       builder: (context, _) {
-        final connected =
-            bluetooth.connectionState == BluetoothConnectionState.connected;
+        final connected = bluetooth.isReady;
+        final supportedResults = bluetooth.scanResults
+            .where(SomniBluetoothService.isSupportedHealthScanResult)
+            .toList(growable: false);
 
         return SafeArea(
           child: Padding(
@@ -681,7 +1663,7 @@ class SomniBluetoothPanel extends StatelessWidget {
                       const SizedBox(width: 10),
                       Expanded(
                         child: Text(
-                          'SOMNI DEVICE LINK',
+                          'HEALTH DEVICE LINK',
                           style: GoogleFonts.lato(
                             fontWeight: FontWeight.bold,
                             letterSpacing: 2,
@@ -776,18 +1758,18 @@ class SomniBluetoothPanel extends StatelessWidget {
                         label: Text(
                           bluetooth.isScanning
                               ? 'SCANNING...'
-                              : 'SCAN FOR SOMNI DEVICE',
+                              : 'SCAN FOR HEALTH DEVICES',
                         ),
                       ),
                     ),
                     const SizedBox(height: 12),
                     Expanded(
-                      child: bluetooth.scanResults.isEmpty
+                      child: supportedResults.isEmpty
                           ? Center(
                               child: Text(
                                 bluetooth.isScanning
                                     ? 'Searching for nearby BLE devices...'
-                                    : 'No devices found yet. Tap scan to search.',
+                                    : 'No compatible health devices found yet. Tap scan to search.',
                                 textAlign: TextAlign.center,
                                 style: GoogleFonts.lato(
                                   color: Colors.grey.shade600,
@@ -795,15 +1777,15 @@ class SomniBluetoothPanel extends StatelessWidget {
                               ),
                             )
                           : ListView.separated(
-                              itemCount: bluetooth.scanResults.length,
+                              itemCount: supportedResults.length,
                               separatorBuilder: (_, __) =>
                                   const Divider(height: 1),
                               itemBuilder: (context, index) {
-                                final result = bluetooth.scanResults[index];
+                                final result = supportedResults[index];
                                 final device = result.device;
                                 final name = device.platformName.isNotEmpty
                                     ? device.platformName
-                                    : 'Unnamed BLE device';
+                                    : result.advertisementData.advName;
 
                                 return ListTile(
                                   contentPadding: EdgeInsets.zero,
@@ -823,7 +1805,10 @@ class SomniBluetoothPanel extends StatelessWidget {
                                     style: GoogleFonts.lato(fontSize: 10),
                                   ),
                                   trailing: TextButton(
-                                    onPressed: () => bluetooth.connect(device),
+                                    onPressed: () => bluetooth.connect(
+                                      device,
+                                      advertisedName: result.advertisementData.advName,
+                                    ),
                                     child: const Text('CONNECT'),
                                   ),
                                 );
@@ -854,7 +1839,12 @@ class SomniBluetoothPanel extends StatelessWidget {
 
 class MainNavigationTerminal extends StatefulWidget {
   final VoidCallback onLogout;
-  const MainNavigationTerminal({super.key, required this.onLogout});
+  final SomniBluetoothService bluetooth;
+  const MainNavigationTerminal({
+    super.key,
+    required this.onLogout,
+    required this.bluetooth,
+  });
 
   @override
   State<MainNavigationTerminal> createState() => _MainNavigationTerminalState();
@@ -862,8 +1852,7 @@ class MainNavigationTerminal extends StatefulWidget {
 
 class _MainNavigationTerminalState extends State<MainNavigationTerminal> {
   int _currentIndex = 0;
-  
-  final SomniBluetoothService _bluetooth = SomniBluetoothService();
+  late final SomniBluetoothService _bluetooth = widget.bluetooth;
 
   void _openBluetoothPanel() {
     showModalBottomSheet(
@@ -877,14 +1866,11 @@ class _MainNavigationTerminalState extends State<MainNavigationTerminal> {
     );
   }
 
-  @override
-  void dispose() {
-    _bluetooth.dispose();
-    super.dispose();
-  }
-
-  final List<Widget> _screens = [
-    const AIConciergeScreen(),
+  List<Widget> get _screens => [
+    AIConciergeScreen(
+      bluetooth: _bluetooth,
+      onConnectPressed: _openBluetoothPanel,
+    ),
     const DeepGoalTrackerScreen(),
     const ClinicalArchivesScreen(),
   ];
@@ -902,10 +1888,9 @@ class _MainNavigationTerminalState extends State<MainNavigationTerminal> {
           AnimatedBuilder(
             animation: _bluetooth,
             builder: (context, _) {
-              final connected = _bluetooth.connectionState ==
-                  BluetoothConnectionState.connected;
+              final connected = _bluetooth.isReady;
               return IconButton(
-                tooltip: connected ? 'SOMNI device connected' : 'Connect SOMNI device',
+                tooltip: connected ? 'Health device connected' : 'Connect health device',
                 onPressed: _openBluetoothPanel,
                 icon: Icon(
                   connected ? Icons.bluetooth_connected : Icons.bluetooth,
@@ -1045,7 +2030,14 @@ class EliteDrawer extends StatelessWidget {
 
 
 class AIConciergeScreen extends StatefulWidget {
-  const AIConciergeScreen({super.key});
+  final SomniBluetoothService bluetooth;
+  final VoidCallback onConnectPressed;
+
+  const AIConciergeScreen({
+    super.key,
+    required this.bluetooth,
+    required this.onConnectPressed,
+  });
 
   @override
   State<AIConciergeScreen> createState() => _AIConciergeScreenState();
@@ -1141,41 +2133,99 @@ class _AIConciergeScreenState extends State<AIConciergeScreen> with SingleTicker
   }
 
   Widget _build3DTelemetryHeader() {
-    return Container(
-      height: 180, width: double.infinity,
-      color: const Color(0xFF0F0F0F),
-      child: Stack(
-        children: [
-          AnimatedBuilder(
-            animation: _pulseCtrl,
-            builder: (ctx, child) => CustomPaint(painter: NeuralCorePainter(animationValue: _pulseCtrl.value), size: Size.infinite),
-          ),
-          Positioned(
-            top: 16, right: 16,
-            child: IconButton(
-              icon: const Icon(Icons.bookmark_add, color: Color(0xFFB59451)),
-              tooltip: 'Save Chat to Vault', onPressed: _saveCurrentChat,
-            ),
-          ),
-          Positioned(
-            bottom: 24, left: 24,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('LIVE CORE TELEMETRY', style: GoogleFonts.lato(color: Colors.grey.shade400, fontSize: 10, letterSpacing: 4)),
-                const SizedBox(height: 8),
-                Row(
+    return AnimatedBuilder(
+      animation: widget.bluetooth,
+      builder: (context, _) {
+        final connected = widget.bluetooth.connectionState ==
+            BluetoothConnectionState.connected;
+        final hasData = connected && widget.bluetooth.hasSensorData;
+
+        String metricValue(String key) {
+          final value = widget.bluetooth.sensorMetrics[key];
+          if (value == null) return '--';
+          return value == value.roundToDouble()
+              ? value.toInt().toString()
+              : value.toStringAsFixed(1);
+        }
+
+        return Container(
+          height: 180,
+          width: double.infinity,
+          color: const Color(0xFF0F0F0F),
+          child: Stack(
+            children: [
+              AnimatedBuilder(
+                animation: _pulseCtrl,
+                builder: (ctx, child) => CustomPaint(
+                  painter: NeuralCorePainter(animationValue: _pulseCtrl.value),
+                  size: Size.infinite,
+                ),
+              ),
+              Positioned(
+                top: 16,
+                right: 16,
+                child: IconButton(
+                  icon: const Icon(Icons.bookmark_add, color: Color(0xFFB59451)),
+                  tooltip: 'Save Chat to Vault',
+                  onPressed: _saveCurrentChat,
+                ),
+              ),
+              Positioned(
+                bottom: 18,
+                left: 24,
+                right: 16,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    _miniMetric('HR', '48', 'bpm'), const SizedBox(width: 16),
-                    _miniMetric('HRV', '92', 'ms'), const SizedBox(width: 16),
-                    _miniMetric('O2', '99', '%'),
+                    Text(
+                      !connected
+                          ? 'NO SOMNI DEVICE CONNECTED'
+                          : hasData
+                              ? 'LIVE CORE TELEMETRY'
+                              : 'DEVICE CONNECTED • WAITING FOR DATA',
+                      style: GoogleFonts.lato(
+                        color: Colors.grey.shade400,
+                        fontSize: 10,
+                        letterSpacing: 2,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    if (!connected)
+                      OutlinedButton.icon(
+                        onPressed: widget.onConnectPressed,
+                        icon: const Icon(Icons.bluetooth, size: 16),
+                        label: const Text('CONNECT SOMNI DEVICE'),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: const Color(0xFFB59451),
+                          side: const BorderSide(color: Color(0xFFB59451)),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 8,
+                          ),
+                          textStyle: GoogleFonts.lato(
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 1,
+                          ),
+                        ),
+                      )
+                    else
+                      Row(
+                        children: [
+                          _miniMetric('HR', metricValue('hr'), 'bpm'),
+                          const SizedBox(width: 16),
+                          _miniMetric('HRV', metricValue('hrv'), 'ms'),
+                          const SizedBox(width: 16),
+                          _miniMetric('O2', metricValue('spo2'), '%'),
+                        ],
+                      ),
                   ],
-                )
-              ],
-            ),
-          )
-        ],
-      ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -1271,7 +2321,15 @@ class DeepGoalTrackerScreen extends StatelessWidget {
                     const SizedBox(height: 8),
                     Text(goal.description, style: GoogleFonts.lato(fontSize: 12, color: Colors.grey.shade600)),
                     const SizedBox(height: 16),
-                    LinearProgressIndicator(value: goal.overallProgress + (i*0.1), backgroundColor: const Color(0xFFF4F3EF), color: const Color(0xFFB59451), minHeight: 4),
+                    Text(
+                      'NO DEVICE-DERIVED PROGRESS RECORDED',
+                      style: GoogleFonts.lato(
+                        fontSize: 9,
+                        color: Colors.grey.shade500,
+                        letterSpacing: 1,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -1305,16 +2363,44 @@ class GoalDeepDiveScreen extends StatelessWidget {
                 Text('PROTOCOL:', style: GoogleFonts.lato(color: const Color(0xFFB59451), fontSize: 12, letterSpacing: 3)),
                 Text(goal.title, style: GoogleFonts.playfairDisplay(fontSize: 36, color: Colors.white, fontWeight: FontWeight.bold)),
                 const SizedBox(height: 40),
-                Center(
-                  child: SizedBox(
-                    height: 250, width: 250,
-                    child: CustomPaint(painter: RadarChartPainter(progress: goal.overallProgress + (index * 0.1))),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(vertical: 36, horizontal: 20),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.04),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: Colors.white10),
+                  ),
+                  child: Column(
+                    children: [
+                      const Icon(
+                        Icons.sensors_off,
+                        color: Color(0xFFB59451),
+                        size: 36,
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        'NO MEASURED DATA YET',
+                        style: GoogleFonts.lato(
+                          color: const Color(0xFFB59451),
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 2,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Connect SOMNI and collect sensor readings to see measured progress here.',
+                        textAlign: TextAlign.center,
+                        style: GoogleFonts.lato(
+                          color: Colors.grey.shade400,
+                          fontSize: 12,
+                          height: 1.5,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                const SizedBox(height: 40),
-                Text('SUB-METRIC VECTOR ANALYSIS', style: GoogleFonts.lato(color: Colors.grey.shade500, fontSize: 10, letterSpacing: 2)),
-                const SizedBox(height: 16),
-                ...goal.metrics.map((m) => _buildSubMetricBar(m.name, m.value)),
               ],
             ),
           ),
@@ -1350,166 +2436,66 @@ class GoalDeepDiveScreen extends StatelessWidget {
 class ClinicalArchivesScreen extends StatelessWidget {
   const ClinicalArchivesScreen({super.key});
 
-  void _openDayTelemetry(BuildContext context, int day, UserProfile profile) {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) => DailyTelemetrySheet(day: day, profile: profile),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
-    final profile = SomniSystemCore.of(context)!.profile;
     return Padding(
       padding: const EdgeInsets.all(24.0),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Temporal Matrix', style: GoogleFonts.playfairDisplay(fontSize: 28, fontWeight: FontWeight.bold)),
-          Text('Historical biometrics & intervention logs.', style: GoogleFonts.lato(fontSize: 12, color: Colors.grey.shade600)),
-          const SizedBox(height: 24),
-          Expanded(
-            child: GridView.builder(
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 7, crossAxisSpacing: 10, mainAxisSpacing: 10),
-              itemCount: 31,
-              itemBuilder: (ctx, i) {
-                int day = i + 1;
-                bool isPast = day <= DateTime.now().day; 
-                
-
-                double completionAlpha = isPast ? ((day % 5) * 0.2) + 0.2 : 0; 
-                
-                return GestureDetector(
-                  onTap: isPast ? () => _openDayTelemetry(context, day, profile) : null,
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 300),
-                    decoration: BoxDecoration(
-                      color: isPast ? const Color(0xFFB59451).withValues(alpha: completionAlpha) : Colors.transparent,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: isPast ? Colors.transparent : Colors.grey.shade300),
-                      boxShadow: isPast ? [BoxShadow(color: const Color(0xFFB59451).withValues(alpha: 0.2), blurRadius: 10)] : [],
-                    ),
-                    child: Center(
-                      child: Text('$day', style: TextStyle(
-                        color: isPast ? (completionAlpha > 0.5 ? Colors.white : Colors.black) : Colors.grey, 
-                        fontWeight: isPast ? FontWeight.bold : FontWeight.normal
-                      )),
-                    ),
-                  ),
-                );
-              },
+          Text(
+            'Temporal Matrix',
+            style: GoogleFonts.playfairDisplay(
+              fontSize: 28,
+              fontWeight: FontWeight.bold,
             ),
-          )
+          ),
+          Text(
+            'Historical biometrics & intervention logs.',
+            style: GoogleFonts.lato(
+              fontSize: 12,
+              color: Colors.grey.shade600,
+            ),
+          ),
+          const Spacer(),
+          Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.inventory_2_outlined,
+                  size: 44,
+                  color: Colors.grey.shade400,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'NO HISTORICAL DATA',
+                  style: GoogleFonts.lato(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 2,
+                    color: const Color(0xFFB59451),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Recorded sensor history will appear here once data logging is enabled.',
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.lato(
+                    fontSize: 12,
+                    color: Colors.grey.shade600,
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Spacer(),
         ],
       ),
     );
   }
 }
-
-
-class DailyTelemetrySheet extends StatelessWidget {
-  final int day;
-  final UserProfile profile;
-  const DailyTelemetrySheet({super.key, required this.day, required this.profile});
-
-  @override
-  Widget build(BuildContext context) {
-
-    int recovery = 70 + (day % 30);
-    int strain = 40 + (day * 2 % 60);
-    int sleep = 60 + (day * 3 % 40);
-
-    return BackdropFilter(
-      filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
-      child: Container(
-        height: MediaQuery.of(context).size.height * 0.75,
-        padding: const EdgeInsets.all(32),
-        decoration: BoxDecoration(
-          color: const Color(0xFF1E2124).withValues(alpha: 0.9),
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(30)),
-          border: Border(top: BorderSide(color: const Color(0xFFB59451).withValues(alpha: 0.5))),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Center(child: Container(width: 40, height: 4, decoration: BoxDecoration(color: Colors.grey.shade700, borderRadius: BorderRadius.circular(2)))),
-            const SizedBox(height: 32),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text('Day $day Analytics', style: GoogleFonts.playfairDisplay(fontSize: 28, color: Colors.white, fontWeight: FontWeight.bold)),
-                const Icon(Icons.verified_user, color: Color(0xFFB59451)),
-              ],
-            ),
-            const SizedBox(height: 40),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceAround,
-              children: [
-                _buildRing('Recovery', recovery, const Color(0xFF4CAF50)),
-                _buildRing('Strain', strain, const Color(0xFFB59451)),
-                _buildRing('Sleep', sleep, const Color(0xFF2196F3)),
-              ],
-            ),
-            const SizedBox(height: 48),
-            Text('GOAL CONTRIBUTIONS', style: GoogleFonts.lato(color: Colors.grey.shade500, fontSize: 11, letterSpacing: 2, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 16),
-            Expanded(
-              child: ListView.builder(
-                itemCount: profile.goals.length,
-                itemBuilder: (ctx, i) {
-                  final goal = profile.goals[i];
-                  return Container(
-                    margin: const EdgeInsets.only(bottom: 12),
-                    padding: const EdgeInsets.all(16),
-                    decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.05), borderRadius: BorderRadius.circular(12)),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.auto_graph, color: Color(0xFFB59451), size: 20),
-                        const SizedBox(width: 16),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(goal.title, style: GoogleFonts.lato(color: Colors.white, fontWeight: FontWeight.bold)),
-                              Text('+ 1.2% optimal trajectory achieved.', style: GoogleFonts.lato(color: Colors.grey.shade400, fontSize: 12)),
-                            ],
-                          ),
-                        )
-                      ],
-                    ),
-                  );
-                },
-              ),
-            )
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildRing(String label, int value, Color color) {
-    return Column(
-      children: [
-        SizedBox(
-          height: 70, width: 70,
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              CircularProgressIndicator(value: value / 100, backgroundColor: Colors.white10, color: color, strokeWidth: 6),
-              Center(child: Text('$value%', style: GoogleFonts.lato(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16))),
-            ],
-          ),
-        ),
-        const SizedBox(height: 12),
-        Text(label, style: GoogleFonts.lato(color: Colors.grey.shade400, fontSize: 12)),
-      ],
-    );
-  }
-}
-
-
 
 
 class CognitiveVaultScreen extends StatelessWidget {
@@ -1696,59 +2682,6 @@ class NeuralCorePainter extends CustomPainter {
     }
   }
 
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
-}
-
-class RadarChartPainter extends CustomPainter {
-  final double progress;
-  RadarChartPainter({required this.progress});
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final center = Offset(size.width / 2, size.height / 2);
-    double radius = size.width / 2.2;
-    int sides = 5;
-
-    final gridPaint = Paint()..color = Colors.white.withValues(alpha: 0.1)..style = PaintingStyle.stroke..strokeWidth = 1;
-    for (int step = 1; step <= 4; step++) {
-      Path path = Path();
-      double r = radius * (step / 4);
-      for (int i = 0; i < sides; i++) {
-        double angle = (i * 2 * math.pi / sides) - (math.pi / 2);
-        double x = center.dx + r * math.cos(angle);
-        double y = center.dy + r * math.sin(angle);
-        if (i == 0) {
-          path.moveTo(x, y);
-        } else {
-          path.lineTo(x, y);
-        }
-      }
-      path.close();
-      canvas.drawPath(path, gridPaint);
-    }
-
-    final dataPaint = Paint()..color = const Color(0xFFB59451).withValues(alpha: 0.4)..style = PaintingStyle.fill;
-    final linePaint = Paint()..color = const Color(0xFFB59451)..style = PaintingStyle.stroke..strokeWidth = 2;
-    Path dataPath = Path();
-    
-    List<double> mockData = [progress, progress*0.8, progress*1.1, progress*0.9, progress*1.2]; 
-
-    for (int i = 0; i < sides; i++) {
-      double angle = (i * 2 * math.pi / sides) - (math.pi / 2);
-      double val = mockData[i].clamp(0.0, 1.0);
-      double x = center.dx + (radius * val) * math.cos(angle);
-      double y = center.dy + (radius * val) * math.sin(angle);
-      if (i == 0) {
-        dataPath.moveTo(x, y);
-      } else {
-        dataPath.lineTo(x, y);
-      }
-    }
-    dataPath.close();
-    canvas.drawPath(dataPath, dataPaint);
-    canvas.drawPath(dataPath, linePaint);
-  }
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
 }
