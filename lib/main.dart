@@ -4,6 +4,11 @@ import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'dart:ui';
 import 'dart:math' as math;
+import 'dart:convert';
+import 'dart:async';
+import 'dart:io' show Platform;
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 void main() {
   runApp(const SomniApp());
@@ -408,6 +413,442 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   }
 }
 
+
+/// ------------------------------------------------------------------
+/// SOMNI BLE SERVICE
+/// Scans for BLE peripherals, connects, discovers GATT services, and
+/// listens to the first characteristic that supports notifications.
+/// ------------------------------------------------------------------
+class SomniBluetoothService extends ChangeNotifier {
+  final List<ScanResult> scanResults = [];
+  BluetoothDevice? connectedDevice;
+  BluetoothConnectionState connectionState =
+      BluetoothConnectionState.disconnected;
+  bool isScanning = false;
+  String latestData = 'No sensor data received yet.';
+  String statusMessage = 'Bluetooth is ready.';
+  String? errorMessage;
+  String? connectedDeviceName;
+
+  StreamSubscription<List<ScanResult>>? _scanResultsSubscription;
+  StreamSubscription<bool>? _scanningSubscription;
+  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
+  StreamSubscription<List<int>>? _dataSubscription;
+  BluetoothCharacteristic? _activeNotifyCharacteristic;
+
+  SomniBluetoothService() {
+    _scanResultsSubscription = FlutterBluePlus.scanResults.listen((results) {
+      scanResults
+        ..clear()
+        ..addAll(results);
+      notifyListeners();
+    });
+    _scanningSubscription = FlutterBluePlus.isScanning.listen((scanning) {
+      isScanning = scanning;
+      notifyListeners();
+    });
+  }
+
+  Future<bool> _requestAndroidPermissions() async {
+    if (!Platform.isAndroid) return true;
+
+    final statuses = await <Permission>[
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.location,
+    ].request();
+
+    final modernPermissionsGranted =
+        statuses[Permission.bluetoothScan]?.isGranted == true &&
+        statuses[Permission.bluetoothConnect]?.isGranted == true;
+    final legacyLocationGranted =
+        statuses[Permission.location]?.isGranted == true;
+
+    // Android 12+ uses BLUETOOTH_SCAN/CONNECT. Android 11 and earlier
+    // require location permission for BLE scanning.
+    return modernPermissionsGranted || legacyLocationGranted;
+  }
+
+  Future<void> startScan() async {
+    try {
+      errorMessage = null;
+      statusMessage = 'Searching for nearby BLE devices...';
+      scanResults.clear();
+      notifyListeners();
+
+      final supported = await FlutterBluePlus.isSupported;
+      if (!supported) {
+        throw Exception('Bluetooth Low Energy is not supported on this phone.');
+      }
+
+      final permissionsGranted = await _requestAndroidPermissions();
+      if (!permissionsGranted) {
+        throw Exception('Bluetooth permission was not granted. Enable Nearby Devices/Bluetooth permission in phone settings.');
+      }
+
+      await FlutterBluePlus.adapterState
+          .where((state) => state == BluetoothAdapterState.on)
+          .first;
+
+      await FlutterBluePlus.startScan(
+        timeout: const Duration(seconds: 8),
+        androidUsesFineLocation: true,
+      );
+      isScanning = true;
+      notifyListeners();
+    } catch (e) {
+      errorMessage = e.toString();
+      statusMessage = 'Scan could not start.';
+      isScanning = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> stopScan() async {
+    try {
+      await FlutterBluePlus.stopScan();
+    } catch (_) {
+      // The scan may already have stopped.
+    }
+    isScanning = false;
+    notifyListeners();
+  }
+
+  Future<void> connect(BluetoothDevice device) async {
+    try {
+      errorMessage = null;
+      statusMessage = 'Connecting to ${device.platformName.isEmpty ? device.remoteId.str : device.platformName}...';
+      notifyListeners();
+
+      await stopScan();
+
+      if (connectedDevice != null) {
+        await disconnect();
+      }
+
+      await device.connect(
+        timeout: const Duration(seconds: 15),
+        autoConnect: false,
+      );
+
+      connectedDevice = device;
+      connectedDeviceName = device.platformName.isNotEmpty
+          ? device.platformName
+          : device.remoteId.str;
+
+      await _connectionSubscription?.cancel();
+      _connectionSubscription = device.connectionState.listen((state) {
+        connectionState = state;
+        if (state == BluetoothConnectionState.disconnected) {
+          connectedDevice = null;
+          connectedDeviceName = null;
+          _dataSubscription?.cancel();
+          _activeNotifyCharacteristic = null;
+          statusMessage = 'Device disconnected.';
+        } else {
+          statusMessage = 'Connected to $connectedDeviceName.';
+        }
+        notifyListeners();
+      });
+
+      connectionState = BluetoothConnectionState.connected;
+      statusMessage = 'Connected. Discovering sensor services...';
+      notifyListeners();
+
+      await _discoverAndListen(device);
+    } catch (e) {
+      errorMessage = e.toString();
+      statusMessage = 'Connection failed.';
+      connectionState = BluetoothConnectionState.disconnected;
+      connectedDevice = null;
+      connectedDeviceName = null;
+      notifyListeners();
+      try {
+        await device.disconnect();
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _discoverAndListen(BluetoothDevice device) async {
+    final services = await device.discoverServices();
+    BluetoothCharacteristic? notifyCharacteristic;
+
+    for (final service in services) {
+      for (final characteristic in service.characteristics) {
+        final properties = characteristic.properties;
+        if (properties.notify || properties.indicate) {
+          notifyCharacteristic = characteristic;
+          break;
+        }
+      }
+      if (notifyCharacteristic != null) break;
+    }
+
+    if (notifyCharacteristic == null) {
+      statusMessage =
+          'Connected, but no BLE notify/indicate characteristic was found.';
+      latestData =
+          'The ESP32 must expose a GATT characteristic with Notify or Indicate enabled.';
+      notifyListeners();
+      return;
+    }
+
+    _activeNotifyCharacteristic = notifyCharacteristic;
+    await notifyCharacteristic.setNotifyValue(true);
+    await _dataSubscription?.cancel();
+
+    _dataSubscription = notifyCharacteristic.onValueReceived.listen((bytes) {
+      if (bytes.isEmpty) return;
+
+      // Display text/JSON payloads when possible; otherwise show raw bytes.
+      try {
+        latestData = utf8.decode(bytes, allowMalformed: true).trim();
+      } catch (_) {
+        latestData = bytes.map((b) => b.toString()).join(', ');
+      }
+
+      statusMessage = 'Receiving data from $connectedDeviceName.';
+      notifyListeners();
+    });
+
+    statusMessage =
+        'Connected. Listening for sensor notifications (${notifyCharacteristic.uuid}).';
+    notifyListeners();
+  }
+
+  Future<void> disconnect() async {
+    final device = connectedDevice;
+    await _dataSubscription?.cancel();
+    _dataSubscription = null;
+    _activeNotifyCharacteristic = null;
+
+    if (device != null) {
+      try {
+        await device.disconnect();
+      } catch (_) {}
+    }
+
+    connectedDevice = null;
+    connectedDeviceName = null;
+    connectionState = BluetoothConnectionState.disconnected;
+    statusMessage = 'Device disconnected.';
+    latestData = 'No sensor data received yet.';
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _scanResultsSubscription?.cancel();
+    _scanningSubscription?.cancel();
+    _connectionSubscription?.cancel();
+    _dataSubscription?.cancel();
+    FlutterBluePlus.stopScan();
+    connectedDevice?.disconnect();
+    super.dispose();
+  }
+}
+
+/// Bluetooth device picker and live data monitor.
+class SomniBluetoothPanel extends StatelessWidget {
+  final SomniBluetoothService bluetooth;
+
+  const SomniBluetoothPanel({super.key, required this.bluetooth});
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: bluetooth,
+      builder: (context, _) {
+        final connected =
+            bluetooth.connectionState == BluetoothConnectionState.connected;
+
+        return SafeArea(
+          child: Padding(
+            padding: EdgeInsets.only(
+              left: 20,
+              right: 20,
+              top: 24,
+              bottom: MediaQuery.of(context).viewInsets.bottom + 24,
+            ),
+            child: SizedBox(
+              height: MediaQuery.of(context).size.height * 0.75,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(Icons.bluetooth, color: Color(0xFFB59451)),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'SOMNI DEVICE LINK',
+                          style: GoogleFonts.lato(
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 2,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: () => Navigator.pop(context),
+                        icon: const Icon(Icons.close),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    connected
+                        ? 'CONNECTED • ${bluetooth.connectedDeviceName ?? "SOMNI"}'
+                        : 'NOT CONNECTED',
+                    style: GoogleFonts.lato(
+                      color: connected
+                          ? const Color(0xFF388E3C)
+                          : Colors.grey.shade600,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    bluetooth.statusMessage,
+                    style: GoogleFonts.lato(
+                      color: Colors.grey.shade700,
+                      fontSize: 12,
+                    ),
+                  ),
+                  if (bluetooth.errorMessage != null) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      bluetooth.errorMessage!,
+                      style: const TextStyle(color: Colors.red, fontSize: 11),
+                    ),
+                  ],
+                  const SizedBox(height: 18),
+                  if (connected) ...[
+                    Text(
+                      'LIVE DEVICE DATA',
+                      style: GoogleFonts.lato(
+                        fontSize: 10,
+                        letterSpacing: 2,
+                        fontWeight: FontWeight.bold,
+                        color: const Color(0xFFB59451),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF4F3EF),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: SelectableText(
+                        bluetooth.latestData,
+                        style: GoogleFonts.robotoMono(fontSize: 12),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        onPressed: bluetooth.disconnect,
+                        icon: const Icon(Icons.link_off),
+                        label: const Text('DISCONNECT DEVICE'),
+                      ),
+                    ),
+                  ] else ...[
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF1E2124),
+                          foregroundColor: const Color(0xFFB59451),
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                        ),
+                        onPressed:
+                            bluetooth.isScanning ? null : bluetooth.startScan,
+                        icon: Icon(
+                          bluetooth.isScanning
+                              ? Icons.radar
+                              : Icons.bluetooth_searching,
+                        ),
+                        label: Text(
+                          bluetooth.isScanning
+                              ? 'SCANNING...'
+                              : 'SCAN FOR SOMNI DEVICE',
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Expanded(
+                      child: bluetooth.scanResults.isEmpty
+                          ? Center(
+                              child: Text(
+                                bluetooth.isScanning
+                                    ? 'Searching for nearby BLE devices...'
+                                    : 'No devices found yet. Tap scan to search.',
+                                textAlign: TextAlign.center,
+                                style: GoogleFonts.lato(
+                                  color: Colors.grey.shade600,
+                                ),
+                              ),
+                            )
+                          : ListView.separated(
+                              itemCount: bluetooth.scanResults.length,
+                              separatorBuilder: (_, __) =>
+                                  const Divider(height: 1),
+                              itemBuilder: (context, index) {
+                                final result = bluetooth.scanResults[index];
+                                final device = result.device;
+                                final name = device.platformName.isNotEmpty
+                                    ? device.platformName
+                                    : 'Unnamed BLE device';
+
+                                return ListTile(
+                                  contentPadding: EdgeInsets.zero,
+                                  leading: const Icon(
+                                    Icons.watch,
+                                    color: Color(0xFFB59451),
+                                  ),
+                                  title: Text(
+                                    name,
+                                    style: GoogleFonts.lato(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 13,
+                                    ),
+                                  ),
+                                  subtitle: Text(
+                                    '${device.remoteId.str} • RSSI ${result.rssi} dBm',
+                                    style: GoogleFonts.lato(fontSize: 10),
+                                  ),
+                                  trailing: TextButton(
+                                    onPressed: () => bluetooth.connect(device),
+                                    child: const Text('CONNECT'),
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                  const SizedBox(height: 8),
+                  Text(
+                    'Keep the device nearby and make sure its Bluetooth advertising is enabled.',
+                    style: GoogleFonts.lato(
+                      color: Colors.grey.shade500,
+                      fontSize: 10,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
 /// ------------------------------------------------------------------
 /// MASTER LAYOUT (Bottom Nav + Drawer)
 /// ------------------------------------------------------------------
@@ -422,6 +863,26 @@ class MainNavigationTerminal extends StatefulWidget {
 class _MainNavigationTerminalState extends State<MainNavigationTerminal> {
   int _currentIndex = 0;
   
+  final SomniBluetoothService _bluetooth = SomniBluetoothService();
+
+  void _openBluetoothPanel() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (_) => SomniBluetoothPanel(bluetooth: _bluetooth),
+    );
+  }
+
+  @override
+  void dispose() {
+    _bluetooth.dispose();
+    super.dispose();
+  }
+
   final List<Widget> _screens = [
     const AIConciergeScreen(),
     const DeepGoalTrackerScreen(),
@@ -437,6 +898,26 @@ class _MainNavigationTerminalState extends State<MainNavigationTerminal> {
         title: Text('S O M N I', style: GoogleFonts.playfairDisplay(fontWeight: FontWeight.w700, letterSpacing: 8, fontSize: 16)),
         centerTitle: true, backgroundColor: Colors.white, elevation: 0,
         iconTheme: const IconThemeData(color: Colors.black),
+        actions: [
+          AnimatedBuilder(
+            animation: _bluetooth,
+            builder: (context, _) {
+              final connected = _bluetooth.connectionState ==
+                  BluetoothConnectionState.connected;
+              return IconButton(
+                tooltip: connected ? 'SOMNI device connected' : 'Connect SOMNI device',
+                onPressed: _openBluetoothPanel,
+                icon: Icon(
+                  connected ? Icons.bluetooth_connected : Icons.bluetooth,
+                  color: connected
+                      ? const Color(0xFFB59451)
+                      : const Color(0xFF1E2124),
+                ),
+              );
+            },
+          ),
+          const SizedBox(width: 8),
+        ],
       ),
       body: IndexedStack(index: _currentIndex, children: _screens),
       bottomNavigationBar: _buildBottomNav(),
