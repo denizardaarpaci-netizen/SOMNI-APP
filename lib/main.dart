@@ -14,9 +14,9 @@ void main() {
   runApp(const SomniApp());
 }
 
-/// ------------------------------------------------------------------
-/// DATA MODELS & CORE REPOSITORY
-/// ------------------------------------------------------------------
+
+
+
 class UserProfile {
   String name;
   String email;
@@ -57,7 +57,7 @@ class SavedNotebook {
   SavedNotebook(this.title, this.date, this.messages);
 }
 
-/// Core State Manager
+
 class SomniSystemCore extends InheritedWidget {
   final UserProfile profile;
   final List<SavedNotebook> vault;
@@ -83,9 +83,9 @@ class SomniSystemCore extends InheritedWidget {
   }
 }
 
-/// ------------------------------------------------------------------
-/// APP CONFIGURATION & DECLARATIVE ROUTING WRAPPER
-/// ------------------------------------------------------------------
+
+
+
 class SomniApp extends StatefulWidget {
   const SomniApp({super.key});
 
@@ -168,9 +168,9 @@ class _SomniAppState extends State<SomniApp> {
   }
 }
 
-/// ------------------------------------------------------------------
-/// SCREEN 0: KINETIC AUTHENTICATION GATEWAY (Enhanced 3D)
-/// ------------------------------------------------------------------
+
+
+
 class AuthScreen extends StatefulWidget {
   final Function(String) onAuthenticate;
   const AuthScreen({super.key, required this.onAuthenticate});
@@ -210,7 +210,7 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
   Widget build(BuildContext context) {
     return Scaffold(
       key: const ValueKey('AuthScreen'),
-      backgroundColor: const Color(0xFF0D0D0D), // Darker background to pop the gold
+      backgroundColor: const Color(0xFF0D0D0D),
       body: Stack(
         children: [
           AnimatedBuilder(
@@ -274,9 +274,9 @@ class _AuthScreenState extends State<AuthScreen> with SingleTickerProviderStateM
   }
 }
 
-/// ------------------------------------------------------------------
-/// SCREEN 1: ONBOARDING
-/// ------------------------------------------------------------------
+
+
+
 class OnboardingScreen extends StatefulWidget {
   final String email;
   final Function(UserProfile) onCompile;
@@ -414,11 +414,11 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
 }
 
 
-/// ------------------------------------------------------------------
-/// SOMNI BLE SERVICE
-/// Scans for BLE peripherals, connects, discovers GATT services, and
-/// listens to the first characteristic that supports notifications.
-/// ------------------------------------------------------------------
+
+
+
+
+
 class SomniBluetoothService extends ChangeNotifier {
   final List<ScanResult> scanResults = [];
   BluetoothDevice? connectedDevice;
@@ -464,8 +464,8 @@ class SomniBluetoothService extends ChangeNotifier {
     final legacyLocationGranted =
         statuses[Permission.location]?.isGranted == true;
 
-    // Android 12+ uses BLUETOOTH_SCAN/CONNECT. Android 11 and earlier
-    // require location permission for BLE scanning.
+
+
     return modernPermissionsGranted || legacyLocationGranted;
   }
 
@@ -508,7 +508,7 @@ class SomniBluetoothService extends ChangeNotifier {
     try {
       await FlutterBluePlus.stopScan();
     } catch (_) {
-      // The scan may already have stopped.
+
     }
     isScanning = false;
     notifyListeners();
@@ -600,7 +600,7 @@ class SomniBluetoothService extends ChangeNotifier {
     _dataSubscription = notifyCharacteristic.onValueReceived.listen((bytes) {
       if (bytes.isEmpty) return;
 
-      // Display text/JSON payloads when possible; otherwise show raw bytes.
+
       try {
         latestData = utf8.decode(bytes, allowMalformed: true).trim();
       } catch (_) {
@@ -648,7 +648,7 @@ class SomniBluetoothService extends ChangeNotifier {
   }
 }
 
-/// Bluetooth device picker and live data monitor.
+
 class SomniBluetoothPanel extends StatelessWidget {
   final SomniBluetoothService bluetooth;
 
@@ -849,9 +849,9 @@ class SomniBluetoothPanel extends StatelessWidget {
   }
 }
 
-/// ------------------------------------------------------------------
-/// MASTER LAYOUT (Bottom Nav + Drawer)
-/// ------------------------------------------------------------------
+
+
+
 class MainNavigationTerminal extends StatefulWidget {
   final VoidCallback onLogout;
   const MainNavigationTerminal({super.key, required this.onLogout});
@@ -971,16 +971,16 @@ class _MainNavigationTerminalState extends State<MainNavigationTerminal> {
   }
 }
 
-/// ------------------------------------------------------------------
-/// SIDEBAR (Drawer) - THE FIX IS HERE
-/// ------------------------------------------------------------------
+
+
+
 class EliteDrawer extends StatelessWidget {
   final VoidCallback onLogout;
   const EliteDrawer({super.key, required this.onLogout});
 
   @override
   Widget build(BuildContext context) {
-    // We capture the core data here, BEFORE pushing the new route.
+
     final core = SomniSystemCore.of(context)!;
     
     return Drawer(
@@ -1011,7 +1011,7 @@ class EliteDrawer extends StatelessWidget {
           const SizedBox(height: 24),
           _drawerItem(context, Icons.manage_accounts, 'Identity & Biometrics', () {
             Navigator.pop(context);
-            // DIRECT DATA PASSING: Fixes the "Unexpected null value" error perfectly.
+
             Navigator.push(context, MaterialPageRoute(builder: (_) => ProfileEditorScreen(
               profile: core.profile,
               onUpdateProfile: core.updateProfile,
@@ -1041,9 +1041,9 @@ class EliteDrawer extends StatelessWidget {
   }
 }
 
-/// ------------------------------------------------------------------
-/// TAB 1: AI CONCIERGE & NEW COMPLEX NEURAL CORE
-/// ------------------------------------------------------------------
+
+
+
 class AIConciergeScreen extends StatefulWidget {
   const AIConciergeScreen({super.key});
 
@@ -1234,9 +1234,9 @@ class _AIConciergeScreenState extends State<AIConciergeScreen> with SingleTicker
   }
 }
 
-/// ------------------------------------------------------------------
-/// TAB 2: DEEP GOAL TRACKER
-/// ------------------------------------------------------------------
+
+
+
 class DeepGoalTrackerScreen extends StatelessWidget {
   const DeepGoalTrackerScreen({super.key});
 
@@ -1344,9 +1344,9 @@ class GoalDeepDiveScreen extends StatelessWidget {
   }
 }
 
-/// ------------------------------------------------------------------
-/// TAB 3: HIGHLY INTERACTIVE CALENDAR & ARCHIVES
-/// ------------------------------------------------------------------
+
+
+
 class ClinicalArchivesScreen extends StatelessWidget {
   const ClinicalArchivesScreen({super.key});
 
@@ -1378,7 +1378,7 @@ class ClinicalArchivesScreen extends StatelessWidget {
                 int day = i + 1;
                 bool isPast = day <= DateTime.now().day; 
                 
-                // Create a heatmap effect based on day modulus
+
                 double completionAlpha = isPast ? ((day % 5) * 0.2) + 0.2 : 0; 
                 
                 return GestureDetector(
@@ -1408,7 +1408,7 @@ class ClinicalArchivesScreen extends StatelessWidget {
   }
 }
 
-/// The Glassmorphic Detail Sheet when a day is clicked
+
 class DailyTelemetrySheet extends StatelessWidget {
   final int day;
   final UserProfile profile;
@@ -1416,7 +1416,7 @@ class DailyTelemetrySheet extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // Generate mock data deterministic to the day
+
     int recovery = 70 + (day % 30);
     int strain = 40 + (day * 2 % 60);
     int sleep = 60 + (day * 3 % 40);
@@ -1509,11 +1509,11 @@ class DailyTelemetrySheet extends StatelessWidget {
   }
 }
 
-/// ------------------------------------------------------------------
-/// DRAWER SCREEN: COGNITIVE VAULT
-/// ------------------------------------------------------------------
+
+
+
 class CognitiveVaultScreen extends StatelessWidget {
-  final List<SavedNotebook> vault; // Passed via constructor to avoid context issues!
+  final List<SavedNotebook> vault;
   const CognitiveVaultScreen({super.key, required this.vault});
 
   @override
@@ -1544,11 +1544,11 @@ class CognitiveVaultScreen extends StatelessWidget {
   }
 }
 
-/// ------------------------------------------------------------------
-/// DRAWER SCREEN: PROFILE EDITOR
-/// ------------------------------------------------------------------
+
+
+
 class ProfileEditorScreen extends StatefulWidget {
-  final UserProfile profile; // Passed directly from Drawer
+  final UserProfile profile;
   final Function(UserProfile) onUpdateProfile;
 
   const ProfileEditorScreen({super.key, required this.profile, required this.onUpdateProfile});
@@ -1573,7 +1573,7 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       name: nCtrl.text, email: widget.profile.email, age: widget.profile.age, 
       height: hCtrl.text, weight: wCtrl.text, goals: widget.profile.goals,
     );
-    widget.onUpdateProfile(updated); // Safely execute callback
+    widget.onUpdateProfile(updated);
     Navigator.pop(context);
   }
 
@@ -1602,11 +1602,11 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
   }
 }
 
-/// ------------------------------------------------------------------
-/// COMPLEX CUSTOM PAINTERS (Upgraded 3D & Radar)
-/// ------------------------------------------------------------------
 
-/// Auth Screen: 3 Intersecting, Multi-Axis Rotating Spheres
+
+
+
+
 class QuantumAuthPainter extends CustomPainter {
   final double animationValue;
   QuantumAuthPainter({required this.animationValue});
@@ -1620,9 +1620,9 @@ class QuantumAuthPainter extends CustomPainter {
     double radius = size.width * 0.45;
     int points = 30;
 
-    _drawSphere(canvas, center, radius, points, paint, t, t * 1.5, 0); // Sphere 1
-    _drawSphere(canvas, center, radius * 0.75, points ~/ 1.5, paint..color = const Color(0xFFB59451).withValues(alpha: 0.4), -t, 0, t * 2); // Sphere 2
-    _drawSphere(canvas, center, radius * 0.5, points ~/ 2, paint..color = Colors.white.withValues(alpha: 0.1), 0, -t * 2, -t); // Sphere 3
+    _drawSphere(canvas, center, radius, points, paint, t, t * 1.5, 0);
+    _drawSphere(canvas, center, radius * 0.75, points ~/ 1.5, paint..color = const Color(0xFFB59451).withValues(alpha: 0.4), -t, 0, t * 2);
+    _drawSphere(canvas, center, radius * 0.5, points ~/ 2, paint..color = Colors.white.withValues(alpha: 0.1), 0, -t * 2, -t);
   }
 
   void _drawSphere(Canvas canvas, Offset center, double radius, int points, Paint paint, double angleX, double angleY, double angleZ) {
@@ -1631,20 +1631,20 @@ class QuantumAuthPainter extends CustomPainter {
       for (int j = 0; j < points; j++) {
         double lon = 2 * math.pi * (j / (points - 1));
         
-        // Base 3D Coordinates
+
         double x = radius * math.cos(lat) * math.cos(lon);
         double y = radius * math.cos(lat) * math.sin(lon);
         double z = radius * math.sin(lat);
 
-        // X-Axis Rotation
+
         double y1 = y * math.cos(angleX) - z * math.sin(angleX);
         double z1 = y * math.sin(angleX) + z * math.cos(angleX);
         
-        // Y-Axis Rotation
+
         double x2 = x * math.cos(angleY) + z1 * math.sin(angleY);
         double z2 = -x * math.sin(angleY) + z1 * math.cos(angleY);
         
-        // Z-Axis Rotation
+
         double x3 = x2 * math.cos(angleZ) - y1 * math.sin(angleZ);
         double y3 = x2 * math.sin(angleZ) + y1 * math.cos(angleZ);
 
@@ -1657,7 +1657,7 @@ class QuantumAuthPainter extends CustomPainter {
   bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
 }
 
-/// AI Core: Pulsing Neural Helix
+
 class NeuralCorePainter extends CustomPainter {
   final double animationValue;
   NeuralCorePainter({required this.animationValue});
@@ -1679,9 +1679,9 @@ class NeuralCorePainter extends CustomPainter {
       
       for (int i = 0; i <= nodes; i++) {
         double progress = i / nodes;
-        double angle = progress * math.pi * 4 + t + offsetStrand; // Twist multiplier
+        double angle = progress * math.pi * 4 + t + offsetStrand;
         
-        // Helix math mapping to 2D
+
         double x = center.dx + math.sin(angle) * radiusX * (1 - progress.abs());
         double y = center.dy + (progress - 0.5) * radiusY * 2;
         
